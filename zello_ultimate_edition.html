@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zello Klon - Advanced PIN & Hotkey Walkie-Talkie</title>
+    <!-- Ładowanie Firebase SDK -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+        import { 
+            getFirestore, 
+            collection, 
+            doc,
+            getDoc,
+            setDoc,
+            addDoc, 
+            onSnapshot, 
+            query, 
+            orderBy, 
+            limit,
+            serverTimestamp 
+        } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+
+        // Twoja konfiguracja Firebase
+        const firebaseConfig = {
+            apiKey: "AIzaSyBbVlbXsvYUZg0ys4OWQIkOgTuevEaLGNY",
+            authDomain: "poc-talk-66711.firebaseapp.com",
+            projectId: "poc-talk-66711",
+            storageBucket: "poc-talk-66711.firebasestorage.app",
+            messagingSenderId: "202082124946",
+            appId: "1:202082124946:web:e7f4d043375afd107c924b",
+            measurementId: "G-04WTCKGCYF"
+        };
+
+        // Inicjalizacja Firebase
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+
+        // Zmienne aplikacji
+        let currentUser = null;
+        let activeChannelId = null;
+        let activeSubchannelId = null;
+        let mediaRecorder = null;
+        let audioChunks = [];
+        let audioStream = null;
+        let unsubscribeMessages = null;
+        let lastPlayedTimestamp = null;
+        
+        // Zmienne bindowania klawisza PTT
+        let pttKey = "Space"; 
+        let isAssigningKey = false;
+        let isKeyPressed = false;
+
+        // Elementy DOM
+        const authModal = document.getElementById('auth-modal');
+        const appContainer = document.getElementById('app-container');
+        const channelList = document.getElementById('channel-list');
+        const pttBtn = document.getElementById('ptt-btn');
+        const statusText = document.getElementById('status-text');
+        const statusDetail = document.getElementById('status-detail');
+        const volumeBar = document.getElementById('volume-bar');
+        const currentPathText = document.getElementById('current-path');
+        const userDisplay = document.getElementById('user-display');
+        const currentUsernameText = document.getElementById('current-username');
+        const logoutBtn = document.getElementById('logout-btn');
+        const hotkeyBtn = document.getElementById('hotkey-btn');
+
+        // Automatyczne sprawdzanie czy użytkownik był zalogowany (localStorage)
+        window.addEventListener('DOMContentLoaded', () => {
+            const savedUser = localStorage.getItem('zello_user');
+            const savedKey = localStorage.getItem('zello_ptt_key');
+            
+            if (savedKey) {
+                pttKey = savedKey;
+                hotkeyBtn.innerText = `Klawisz PTT: ${pttKey}`;
+            }
+
+            if (savedUser) {
+                loginSuccess(savedUser);
+            }
+        });
+
+        // 1. SYSTEM AUTORYZACJI (LOGOWANIE / REJESTRACJA PINem)
+        document.getElementById('auth-submit').addEventListener('click', async () => {
+            const username = document.getElementById('auth-username').value.trim().toLowerCase();
+            const pin = document.getElementById('auth-pin').value.trim();
+
+            if (!username || pin.length < 4) {
+                alert("Wpisz poprawny nick oraz minimum 4-cyfrowy PIN!");
+                return;
+            }
+
+            const userDocRef = doc(db, "users", username);
+            const userDoc = await getDoc(userDocRef);
+
+            if (userDoc.exists()) {
+                if (userDoc.data().pin === pin) {
+                    localStorage.setItem('zello_user', username);
+                    loginSuccess(username);
+                } else {
+                    alert("Nieprawidłowy PIN dla tego użytkownika!");
+                }
+            } else {
+                if (confirm(`Użytkownik "${username}" nie istnieje. Czy chcesz stworzyć nowe konto z tym PINem?`)) {
+                    await setDoc(userDocRef, {
+                        username: username,
+                        pin: pin,
+                        createdAt: serverTimestamp()
+                    });
+                    localStorage.setItem('zello_user', username);
+                    loginSuccess(username);
+                }
+            }
+        });
+
+        function loginSuccess(username) {
+            currentUser = username;
+            currentUsernameText.innerText = username.toUpperCase();
+            authModal.style.display = 'none';
+            appContainer.style.opacity = '1';
+            appContainer.style.pointerEvents = 'auto';
+            initChannelsRealtime();
+        }
+
+        // WYLOGOWANIE SIĘ
+        logoutBtn.addEventListener('click', () => {
+            localStorage.removeItem('zello_user');
+            currentUser = null;
+            activeChannelId = null;
+            activeSubchannelId = null;
+            
+            if (unsubscribeMessages) unsubscribeMessages();
+            
+            // Reset ekranu statusu
+            currentPathText.innerText = "BRAK WYBRANEGO KANAŁU";
+            statusText.innerText = "BLOKADA";
+            statusDetail.innerText = "Wybierz bezpieczny pokój rozmów z listy";
+            pttBtn.style.opacity = "0.3";
+            pttBtn.style.pointerEvents = "none";
+            pttBtn.classList.remove('talking');
+
+            // Pokazanie panelu logowania
+            appContainer.style.opacity = '0';
+            appContainer.style.pointerEvents = 'none';
+            authModal.style.display = 'flex';
+            
+            document.getElementById('auth-username').value = "";
+            document.getElementById('auth-pin').value = "";
+        });
+
+        // 2. PRZYPISYWANIE PRZYCISKU (HOTKEY MAPPING)
+        hotkeyBtn.addEventListener('click', () => {
+            isAssigningKey = true;
+            hotkeyBtn.innerText = "Naciśnij dowolny klawisz...";
+            hotkeyBtn.style.backgroundColor = "#ffcc00";
+            hotkeyBtn.style.color = "#000";
+        });
+
+        window.addEventListener('keydown', (e) => {
+            // Obsługa przypisywania klawisza
+            if (isAssigningKey) {
+                e.preventDefault();
+                pttKey = e.code; // Np. "Space", "KeyM", "ControlLeft"
+                localStorage.setItem('zello_ptt_key', pttKey);
+                hotkeyBtn.innerText = `Klawisz PTT: ${pttKey}`;
+                hotkeyBtn.style.backgroundColor = "#2b2b2b";
+                hotkeyBtn.style.color = "#fff";
+                isAssigningKey = false;
+                return;
+            }
+
+            // Wyzwalanie nadawania z przypisanego klawisza
+            if (e.code === pttKey && !isKeyPressed && currentUser && activeSubchannelId) {
+                e.preventDefault();
+                isKeyPressed = true;
+                pttBtn.classList.add('talking');
+                startTalking(e);
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (e.code === pttKey && isKeyPressed) {
+                e.preventDefault();
+                isKeyPressed = false;
+                pttBtn.classList.remove('talking');
+                stopTalking();
+            }
+        });
+
+        // 3. ŁADOWANIE KANAŁÓW I ZABEZPIECZEŃ
+        function initChannelsRealtime() {
+            onSnapshot(collection(db, "channels"), (snapshot) => {
+                channelList.innerHTML = '';
+                snapshot.forEach((doc) => {
+                    const channelData = doc.data();
+                    const channelId = doc.id;
+
+                    const channelEl = document.createElement('div');
+                    channelEl.className = 'channel-item';
+                    
+                    const isChanProt = channelData.isProtected ? "🔒" : "🔓";
+                    
+                    const headerEl = document.createElement('div');
+                    headerEl.className = 'channel-header';
+                    headerEl.innerHTML = `
+                        <span>${isChanProt} ${channelData.name}</span>
+                        <button class="add-sub-btn" data-id="${channelId}">+ Podkanał</button>
+                    `;
+                    channelEl.appendChild(headerEl);
+
+                    const subchannelsContainer = document.createElement('div');
+                    subchannelsContainer.className = 'subchannel-list';
+                    
+                    onSnapshot(collection(db, "channels", channelId, "subchannels"), (subSnapshot) => {
+                        subchannelsContainer.innerHTML = '';
+                        subSnapshot.forEach((subDoc) => {
+                            const subData = subDoc.data();
+                            const subchannelId = subDoc.id;
+                            const isSubProt = subData.isProtected ? "🔒" : "🔓";
+
+                            const subEl = document.createElement('div');
+                            subEl.className = 'subchannel-item';
+                            if (activeSubchannelId === subchannelId) {
+                                subEl.classList.add('active');
+                            }
+                            subEl.innerText = `${isSubProt} ${subData.name}`;
+                            
+                            subEl.addEventListener('click', async () => {
+                                if (channelData.isProtected) {
+                                    const inputPin = prompt(`Wprowadź PIN do kanału głównego "${channelData.name}":`);
+                                    if (inputPin !== channelData.pin) {
+                                        alert("Błędny PIN kanału!");
+                                        return;
+                                    }
+                                }
+
+                                if (subData.isProtected) {
+                                    const inputSubPin = prompt(`Wprowadź PIN do podkanału "${subData.name}":`);
+                                    if (inputSubPin !== subData.pin) {
+                                        alert("Błędny PIN podkanału!");
+                                        return;
+                                    }
+                                }
+
+                                selectSubchannel(channelId, channelData.name, subchannelId, subData.name);
+                                document.querySelectorAll('.subchannel-item').forEach(el => el.classList.remove('active'));
+                                subEl.classList.add('active');
+                            });
+
+                            subchannelsContainer.appendChild(subEl);
+                        });
+                    });
+
+                    channelEl.appendChild(subchannelsContainer);
+                    channelList.appendChild(channelEl);
+                });
+            });
+        }
+
+        document.getElementById('add-channel-btn').addEventListener('click', async () => {
+            const name = prompt("Podaj nazwę nowego kanału głównego:");
+            if (!name) return;
+
+            const targetPin = prompt("Jeśli kanał ma być zabezpieczony, wpisz PIN (lub zostaw puste):");
+            const isProtected = targetPin && targetPin.trim().length > 0;
+
+            await addDoc(collection(db, "channels"), { 
+                name: name, 
+                isProtected: isProtected,
+                pin: isProtected ? targetPin.trim() : "",
+                createdAt: serverTimestamp() 
+            });
+        });
+
+        channelList.addEventListener('click', async (e) => {
+            if (e.target.classList.contains('add-sub-btn')) {
+                e.stopPropagation();
+                const channelId = e.target.getAttribute('data-id');
+                const subName = prompt("Podaj nazwę podkanału:");
+                if (!subName) return;
+
+                const targetSubPin = prompt("Jeśli podkanał ma być zabezpieczony, wpisz PIN (lub zostaw puste):");
+                const isProtected = targetSubPin && targetSubPin.trim().length > 0;
+
+                await addDoc(collection(db, "channels", channelId, "subchannels"), {
+                    name: subName,
+                    isProtected: isProtected,
+                    pin: isProtected ? targetSubPin.trim() : "",
+                    createdAt: serverTimestamp()
+                });
+            }
+        });
+
+        function selectSubchannel(channelId, channelName, subchannelId, subchannelName) {
+            activeChannelId = channelId;
+            activeSubchannelId = subchannelId;
+            currentPathText.innerText = `${channelName} > ${subchannelName}`;
+            
+            statusText.innerText = "GOTOWY";
+            statusText.style.color = "#888";
+            statusDetail.innerText = `Naciśnij [${pttKey}] lub przycisk ekranowy, by nadawać`;
+            pttBtn.style.opacity = "1";
+            pttBtn.style.pointerEvents = "auto";
+
+            if (unsubscribeMessages) unsubscribeMessages();
+            lastPlayedTimestamp = Date.now(); 
+
+            const messagesQuery = query(
+                collection(db, "channels", channelId, "subchannels", subchannelId, "messages"),
+                orderBy("createdAt", "desc"),
+                limit(1)
+            );
+
+            unsubscribeMessages = onSnapshot(messagesQuery, (snapshot) => {
+                snapshot.forEach((doc) => {
+                    const msg = doc.data();
+                    if (msg.sender !== currentUser && msg.createdAt) {
+                        const msgTime = msg.createdAt.toDate().getTime();
+                        if (msgTime > lastPlayedTimestamp) {
+                            lastPlayedTimestamp = msgTime;
+                            playAudioBase64(msg.audioBase64);
+                        }
+                    }
+                });
+            });
+        }
+
+        // 4. OBSŁUGA STRUMIENIA AUDIO
+        async function initAudio() {
+            try {
+                audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(audioStream);
+
+                mediaRecorder.ondataavailable = event => {
+                    audioChunks.push(event.data);
+                };
+
+                mediaRecorder.onstop = async () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/ogg; codecs=opus' });
+                    audioChunks = [];
+
+                    statusText.innerText = "WYSYŁANIE...";
+                    statusText.style.color = "#ffcc00";
+
+                    const reader = new FileReader();
+                    reader.readAsDataURL(audioBlob);
+                    reader.onloadend = async () => {
+                        const base64Audio = reader.result;
+
+                        if (activeChannelId && activeSubchannelId) {
+                            await addDoc(collection(db, "channels", activeChannelId, "subchannels", activeSubchannelId, "messages"), {
+                                sender: currentUser,
+                                audioBase64: base64Audio,
+                                createdAt: serverTimestamp()
+                            });
+                            statusText.innerText = "GOTOWY";
+                            statusText.style.color = "#888";
+                            statusDetail.innerText = `Naciśnij [${pttKey}] aby rozmawiać`;
+                        }
+                    };
+                };
+
+            } catch (err) {
+                console.error("Brak dostępu do mikrofonu:", err);
+                statusText.innerText = "BŁĄD MIKROFONU";
+                statusText.style.color = "#ff3b30";
+            }
+        }
+
+        function playAudioBase64(base64Data) {
+            statusText.innerText = "ODBIERANIE...";
+            statusText.style.color = "#34aadc";
+            statusDetail.innerText = "Ktoś nadaje na kanale...";
+            volumeBar.style.width = "100%";
+            volumeBar.style.backgroundColor = "#34aadc";
+
+            const audio = new Audio(base64Data);
+            audio.play();
+
+            audio.onended = () => {
+                statusText.innerText = "GOTOWY";
+                statusText.style.color = "#888";
+                statusDetail.innerText = `Naciśnij [${pttKey}] aby rozmawiać`;
+                volumeBar.style.width = "0%";
+                volumeBar.style.backgroundColor = "#4cd964";
+            };
+        }
+
+        function startTalking(e) {
+            if(e) e.preventDefault();
+            if (!activeSubchannelId) return;
+            if (!mediaRecorder) return;
+
+            if (mediaRecorder.state === "inactive") {
+                mediaRecorder.start();
+                statusText.innerText = "NADAWANIE";
+                statusText.style.color = "#ff3b30";
+                statusDetail.innerText = "Rozmawiaj teraz...";
+                volumeBar.style.width = "100%";
+                volumeBar.style.backgroundColor = "#ff3b30";
+            }
+        }
+
+        function stopTalking() {
+            if (mediaRecorder && mediaRecorder.state === "recording") {
+                mediaRecorder.stop();
+                volumeBar.style.width = "0%";
+            }
+        }
+
+        // Eventy dla klikania myszą i dotyku przycisku ekranowego
+        pttBtn.addEventListener('mousedown', (e) => { pttBtn.classList.add('talking'); startTalking(e); });
+        window.addEventListener('mouseup', () => { pttBtn.classList.remove('talking'); stopTalking(); });
+        pttBtn.addEventListener('touchstart', (e) => { pttBtn.classList.add('talking'); startTalking(e); });
+        window.addEventListener('touchend', () => { pttBtn.classList.remove('talking'); stopTalking(); });
+
+        window.addEventListener('click', () => {
+            if (!audioStream) {
+                initAudio();
+            }
+        }, { once: true });
+    </script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #121212;
+            color: #e0e0e0;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* Ekran logowania */
+        .auth-overlay {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background-color: #121212;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 9999;
+        }
+
+        .auth-box {
+            background-color: #1e1e1e;
+            padding: 40px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            text-align: center;
+            width: 300px;
+            border: 1px solid #333;
+        }
+
+        .auth-box h2 {
+            margin-bottom: 25px;
+            font-size: 1.5rem;
+            color: #fff;
+        }
+
+        .auth-box input {
+            width: 100%;
+            padding: 12px;
+            margin-bottom: 15px;
+            border-radius: 6px;
+            border: 1px solid #444;
+            background-color: #2b2b2b;
+            color: #fff;
+            font-size: 1rem;
+            box-sizing: border-box;
+            text-align: center;
+        }
+
+        .auth-box button {
+            width: 100%;
+            padding: 12px;
+            border-radius: 6px;
+            border: none;
+            background-color: #4cd964;
+            color: #000;
+            font-size: 1rem;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+        /* Główny kontener aplikacji */
+        .app-layout {
+            display: flex;
+            width: 100%;
+            height: 100%;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+        }
+
+        /* Ulepszony Panel boczny */
+        .sidebar {
+            width: 320px;
+            background-color: #1e1e1e;
+            border-right: 1px solid #2d2d2d;
+            display: flex;
+            flex-direction: column;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+
+        .user-panel {
+            background-color: #252525;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border: 1px solid #333;
+        }
+
+        .user-info {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .user-info .label {
+            font-size: 0.7rem;
+            color: #888;
+        }
+
+        .user-info .username {
+            font-size: 1rem;
+            font-weight: bold;
+            color: #4cd964;
+        }
+
+        .logout-button {
+            background-color: #ff3b30;
+            border: none;
+            color: white;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            font-weight: bold;
+            transition: opacity 0.2s;
+        }
+
+        .logout-button:hover {
+            opacity: 0.9;
+        }
+
+        .settings-panel {
+            margin-bottom: 15px;
+        }
+
+        .hotkey-button {
+            width: 100%;
+            background-color: #2b2b2b;
+            color: white;
+            border: 1px solid #444;
+            padding: 8px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: all 0.2s;
+        }
+
+        .sidebar h2 {
+            margin-top: 10px;
+            font-size: 1.2rem;
+            color: #fff;
+            border-bottom: 2px solid #333;
+            padding-bottom: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .add-main-btn {
+            background-color: #4cd964;
+            border: none;
+            color: #000;
+            padding: 5px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 0.8rem;
+        }
+
+        .channel-list-container {
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        .channel-item {
+            margin-bottom: 15px;
+            background-color: #252525;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+
+        .channel-header {
+            padding: 10px;
+            background-color: #2d2d2d;
+            font-weight: bold;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.95rem;
+        }
+
+        .add-sub-btn {
+            background-color: #34aadc;
+            border: none;
+            color: white;
+            font-size: 0.75rem;
+            padding: 3px 6px;
+            border-radius: 3px;
+            cursor: pointer;
+        }
+
+        .subchannel-list {
+            padding-left: 5px;
+        }
+
+        .subchannel-item {
+            padding: 8px 10px;
+            margin: 4px 5px;
+            background-color: #1e1e1e;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9rem;
+        }
+
+        .subchannel-item.active {
+            background-color: #34aadc;
+            color: #fff;
+            font-weight: bold;
+        }
+
+        .main-app {
+            flex: 1;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background-color: #161616;
+        }
+
+        .phone-container {
+            width: 340px;
+            height: 580px;
+            background-color: #222;
+            border-radius: 35px;
+            box-shadow: 0 15px 40px rgba(0,0,0,0.7);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: space-between;
+            padding: 35px 25px;
+            box-sizing: border-box;
+            border: 4px solid #333;
+        }
+
+        .status-screen {
+            width: 100%;
+            height: 90px;
+            background-color: #0b0b0b;
+            border-radius: 12px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            border: 1px solid #222;
+            padding: 5px;
+            box-sizing: border-box;
+        }
+
+        #current-path {
+            font-size: 0.75rem;
+            color: #34aadc;
+            margin-bottom: 5px;
+            text-transform: uppercase;
+            font-weight: bold;
+            text-align: center;
+        }
+
+        #status-text {
+            font-size: 1.3rem;
+            font-weight: bold;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+
+        #status-detail {
+            font-size: 0.8rem;
+            color: #555;
+            margin-top: 4px;
+            text-align: center;
+        }
+
+        .ptt-button {
+            width: 170px;
+            height: 170px;
+            border-radius: 50%;
+            background: radial-gradient(circle, #3a3a3a 0%, #1a1a1a 100%);
+            border: 8px solid #444;
+            cursor: pointer;
+            box-shadow: 0 0 20px rgba(0,0,0,0.6);
+            transition: all 0.1s ease;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            user-select: none;
+            -webkit-user-select: none;
+            opacity: 0.3;
+            pointer-events: none;
+        }
+
+        /* Styl wyzwalany przez kliknięcie MYSZĄ lub KLAWISZEM */
+        .ptt-button:active, .ptt-button.talking {
+            background: radial-gradient(circle, #ff3b30 0%, #8b0000 100%);
+            border-color: #ff6b64;
+            box-shadow: 0 0 30px rgba(255, 59, 48, 0.8);
+            transform: scale(0.96);
+            opacity: 1 !important;
+        }
+
+        .ptt-button::after {
+            content: "PTT";
+            font-weight: bold;
+            font-size: 1.6rem;
+            color: #555;
+        }
+
+        .ptt-button:active::after, .ptt-button.talking::after {
+            color: #fff;
+            text-shadow: 0 0 10px rgba(255,255,255,0.5);
+        }
+
+        .volume-indicator {
+            width: 100%;
+            height: 8px;
+            background-color: #0b0b0b;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        #volume-bar {
+            height: 100%;
+            width: 0%;
+            background-color: #4cd964;
+            transition: width 0.1s ease;
+        }
+
+        .info-msg {
+            font-size: 0.75rem;
+            color: #555;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- OKNO AUTORYZACJI -->
+    <div class="auth-overlay" id="auth-modal">
+        <div class="auth-box">
+            <h2>Konto Walkie-Talkie</h2>
+            <input type="text" id="auth-username" placeholder="Twój Nick (np. adam)" maxlength="15">
+            <input type="password" id="auth-pin" placeholder="Twój PIN (np. 1234)" inputmode="numeric" maxlength="6">
+            <button id="auth-submit">Wejdź do aplikacji</button>
+        </div>
+    </div>
+
+    <!-- INTERFEJS APLIKACJI -->
+    <div class="app-layout" id="app-container">
+        
+        <!-- Panel boczny -->
+        <div class="sidebar">
+            
+            <!-- NOWOŚĆ: Widok użytkownika i wylogowanie -->
+            <div class="user-panel">
+                <div class="user-info">
+                    <span class="label">Profil:</span>
+                    <span class="username" id="current-username">-</span>
+                </div>
+                <button class="logout-button" id="logout-btn">Wyloguj</button>
+            </div>
+
+            <!-- NOWOŚĆ: Bindowanie własnego klawisza PTT -->
+            <div class="settings-panel">
+                <button class="hotkey-button" id="hotkey-btn">Klawisz PTT: Space</button>
+            </div>
+
+            <h2>
+                <span>Kanały</span>
+                <button class="add-main-btn" id="add-channel-btn">+ Główny</button>
+            </h2>
+            <div class="channel-list-container" id="channel-list">
+                <!-- Kanały i podkanały z Firestore -->
+            </div>
+        </div>
+
+        <!-- Główny interfejs walkie-talkie -->
+        <div class="main-app">
+            <div class="phone-container">
+                <div class="status-screen">
+                    <div id="current-path">BRAK WYBRANEGO KANAŁU</div>
+                    <div id="status-text">BLOKADA</div>
+                    <div id="status-detail">Wybierz bezpieczny pokój rozmów z listy</div>
+                </div>
+
+                <div class="ptt-button" id="ptt-btn"></div>
+
+                <div style="width: 100%;">
+                    <div class="volume-indicator">
+                        <div id="volume-bar"></div>
+                    </div>
+                    <p class="info-msg">Kliknij raz w ekran po zalogowaniu, aby aktywować audio</p>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+</body>
+</html>
